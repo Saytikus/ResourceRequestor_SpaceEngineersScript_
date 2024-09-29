@@ -172,13 +172,15 @@ namespace Template {
                         // if subtype isn't equals than skip that item
                         if (supplyItem.Type.SubtypeId != transferItem.SubtypeId) continue;
 
+                        // if item amount for transfer <= 0
+                        if (transferItem.TransferRequestedAmount <= 0) continue;
+
 
                         // if items amount >= item amount for transfer
                         if (supplyItem.Amount.RawValue >= transferItem.TransferRequestedAmount) {
 
                             // init MyFixedPoint from item amount for transfer (long) 
-                            MyFixedPoint fp = new MyFixedPoint();
-                            fp.RawValue = transferItem.TransferRequestedAmount;
+                            MyFixedPoint fp = (int)transferItem.TransferRequestedAmount;
 
                             // if transfer isn't made than return transfer error
                             if (!supplyInventory.TransferItemTo(destinationInventory, supplyItem, fp)) return SmartTransferResult.TransferError;

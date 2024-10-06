@@ -39,6 +39,11 @@ namespace Template {
         // TODO: check for availability all input data blocks
         // TODO: timeout
         // TODO: check for assemblers queues and maybe repeat request items
+        // TODO: check for available volume supply and destination containers
+        // TODO: dictionary subtypeId - component volume
+        // TODO: replace using inventories by blocks for advanced logs
+        // TODO: request for assemble all missing items immediately
+        // TODO: add argument for abort transfer
 
         /** InputData - статический класс, хранящий входные значения скрипта. Здесь необходимо менять названия блоков
          * 
@@ -51,12 +56,14 @@ namespace Template {
             static public string OutputPanelName { get; private set; } = "SMT Output Panel 1";
 
             // supply container names
-            static public List<string> SupplyContainerNames { get; private set; } = new List<string> { 
+            static public List<string> SupplyContainerNames { get; private set; } = new List<string> {
                 "SMT Supply Container 1", "SMT Supply Container 2"
             };
 
-            // Имя конечного контейнера
-            static public string DestinationContainerName { get; private set; } = "SMT Destination Container 1";
+            // destination container names
+            static public List<string> DestinationContainerNames { get; private set; } = new List<string> {
+                "SMT Destination Container 1", "SMT Destination Container 2"
+            };
 
             // assembler names
             static public List<string> AssemblerNames { get; private set; } = new List<string> {
@@ -67,7 +74,7 @@ namespace Template {
         class TransferItem {
             public string SubtypeId { get; private set; }
 
-            public long TransferRequestedAmount { get; set; }
+            public MyFixedPoint TransferRequestedAmount { get; set; }
 
             public bool IsAssembleRequested { get; set; }
 
@@ -78,7 +85,7 @@ namespace Template {
                 IsAssembleRequested = false;
             }
 
-            public void setData(string subtypeId, long amount, bool isAssembleRequested) {
+            public void setData(string subtypeId, MyFixedPoint amount, bool isAssembleRequested) {
 
                 SubtypeId = subtypeId;
                 TransferRequestedAmount = amount;
@@ -98,6 +105,10 @@ namespace Template {
 
             TransferError,
 
+            NotEnoughtSupplyStorageVolume,
+
+            NotEnoughDestinationStorageVolume,
+
             NotEnoughtComponents
 
         }
@@ -106,46 +117,73 @@ namespace Template {
         class SmartItemTransferer {
 
             // Метод перемещения предметов с заказом крафта, если предметов не достаточно
-            public SmartTransferResult smartTransferTo(List<IMyInventory> supplyStorage, IMyInventory destinationInventory, List<TransferItem> transferItems, List<IMyAssembler> assemblers) {
+            public SmartTransferResult smartTransferTo(List<IMyInventory> supplyStorage, List<IMyInventory> destinationStorage, List<TransferItem> transferItems, List<IMyAssembler> assemblers) {
 
-                // if input data is invalid than return input data error
-                if (supplyStorage.Count <= 0 || destinationInventory == null || transferItems.Count <= 0 || assemblers == null) return SmartTransferResult.InputDataError;
+                // if input data is invalid then return input data error
+                if (supplyStorage == null || supplyStorage.Count <= 0
+                    || destinationStorage == null || destinationStorage.Count <= 0
+                    || transferItems == null || transferItems.Count <= 0
+                    || assemblers == null || assemblers.Count <= 0) return SmartTransferResult.InputDataError;
+
+
+                MyFixedPoint itemVolume = new MyFixedPoint();        
+                foreach (TransferItem transferItem in transferItems) {
+                    itemVolume += VolumeCalculator.itemVolumeM3(transferItem.SubtypeId, transferItem.TransferRequestedAmount);
+                }
+
+                if (!VolumeCalculator.isEnoughVolume(destinationStorage, itemVolume)) return SmartTransferResult.NotEnoughDestinationStorageVolume;
+
 
                 foreach (TransferItem transferItem in transferItems) {
 
                     // if item isn't be transfered
                     if (transferItem.TransferRequestedAmount <= 0) continue;
 
+                    // get item amount in storage
+                    MyFixedPoint storageItemAmount = availableItemAmount(supplyStorage, transferItem.SubtypeId);
+
 
                     // if not enought items in storage for make transfer
-                    if (calculateAvailableItemAmount(supplyStorage, transferItem.SubtypeId) < transferItem.TransferRequestedAmount) {
+                    if (storageItemAmount < transferItem.TransferRequestedAmount) {
+
+                        // get item amount for assemble
+                        MyFixedPoint transferItemAssembleAmount = transferItem.TransferRequestedAmount;
+
+                        // if storage item amount is correct then reduce item amount for assemble by storage item amount
+                        if (storageItemAmount > 0) transferItemAssembleAmount -= storageItemAmount;
+
 
                         // if item isn't requested for assemble
                         if (!transferItem.IsAssembleRequested) {
+
                             // on assemble request flag for item
                             transferItem.IsAssembleRequested = true;
 
                             // get item amount that already crafting
-                            int craftCount =  AssemblerManager.itemCraftCount(assemblers, transferItem.SubtypeId);
+                            MyFixedPoint queueItemAmount = AssemblerManager.itemCraftAmount(assemblers, transferItem.SubtypeId);
 
-                            // if already craft amount > 0 than reduce item amount for request assemble
-                            if (craftCount > 0) transferItem.TransferRequestedAmount -= craftCount;
+                            // if already craft amount > 0 and less then item amount for request assemble then reduce item amount for request assemble
+                            if (queueItemAmount > 0 && queueItemAmount < transferItemAssembleAmount) transferItemAssembleAmount -= queueItemAmount;
 
-                            // if requested amount is negative than reset requested amount
-                            if(transferItem.TransferRequestedAmount < 0) transferItem.TransferRequestedAmount = 0;
+                            // else if already craft amount >= item amount for assemble then reset last one
+                            else if (queueItemAmount >= transferItemAssembleAmount) transferItemAssembleAmount = 0;
 
-                            // if assemble isn't made than return assemble error
-                            if (!AssemblerManager.assembleComponent(assemblers, transferItem.SubtypeId, transferItem.TransferRequestedAmount)) return SmartTransferResult.AssemblerError;
+                            // if item amount for assemble isn't reset
+                            if (transferItemAssembleAmount > 0) {
+
+                                // if assemble isn't made then return assemble error
+                                if (!AssemblerManager.assembleComponent(assemblers, transferItem.SubtypeId, transferItemAssembleAmount)) return SmartTransferResult.AssemblerError;
+                            }
 
                         }
 
                         // save snapshot
-                        SmartItemTransfererSnapshot.saveSnapshot(this, new SmartItemTransfererSnapshot.SmartTransferToSnapshot(supplyStorage, destinationInventory, transferItems, assemblers));
+                        SmartItemTransfererSnapshot.saveSnapshot(this, new SmartItemTransfererSnapshot.SmartTransferToSnapshot(supplyStorage, destinationStorage, transferItems, assemblers));
 
                         return SmartTransferResult.NotEnoughtComponents;
                     }
 
-                    SmartTransferResult transferResult = multiTransferTo(supplyStorage, destinationInventory, transferItem);
+                    SmartTransferResult transferResult = multiTransferTo(supplyStorage, destinationStorage, transferItem);
 
                     if (transferResult != SmartTransferResult.Succesful) return transferResult;
 
@@ -154,9 +192,9 @@ namespace Template {
                 return SmartTransferResult.Succesful;
             }
 
-            static private long calculateAvailableItemAmount(List<IMyInventory> inventories, string itemSubtypeID) {
+            static public MyFixedPoint availableItemAmount(List<IMyInventory> inventories, string itemSubtypeID) {
 
-                long availableItemAmount = 0;
+                MyFixedPoint availableItemAmount = 0;
 
                 foreach (IMyInventory inventory in inventories) {
 
@@ -164,7 +202,7 @@ namespace Template {
                     inventory.GetItems(inventoryItems);
                     foreach (MyInventoryItem item in inventoryItems) {
 
-                        if (item.Type.SubtypeId == itemSubtypeID) availableItemAmount += item.Amount.ToIntSafe();
+                        if (item.Type.SubtypeId == itemSubtypeID) availableItemAmount += item.Amount;
 
                     }
 
@@ -173,55 +211,98 @@ namespace Template {
                 return availableItemAmount;
             }
 
-            static private SmartTransferResult multiTransferTo(List<IMyInventory> supplyStorage, IMyInventory destinationInventory, TransferItem transferItem) {
+            static public SmartTransferResult multiTransferTo(List<IMyInventory> supplyStorage, List<IMyInventory> destinationStorage, TransferItem transferItem) {
+
+                // if supply/destination storage is empty or requested transfer amount is 0
+                if (supplyStorage == null || supplyStorage.Count <= 0
+                    || destinationStorage == null || destinationStorage.Count <= 0 
+                    || transferItem.TransferRequestedAmount <= 0) return SmartTransferResult.InputDataError;
+
+                // if dictionary not contains transfer item subTypeId
+                if(!VolumeCalculator.SubTypeIdVolume.ContainsKey(transferItem.SubtypeId)) return SmartTransferResult.InputDataError;
+
 
                 foreach (IMyInventory supplyInventory in supplyStorage) {
-
+                    
                     // get inventory items
                     List<MyInventoryItem> supplyItems = new List<MyInventoryItem>();
                     supplyInventory.GetItems(supplyItems);
 
                     foreach (MyInventoryItem supplyItem in supplyItems) {
 
-                        // if subtype isn't equals than skip that item
+                        // if subtype isn't equals then skip that item
                         if (supplyItem.Type.SubtypeId != transferItem.SubtypeId) continue;
 
-                        // if item amount for transfer <= 0
-                        if (transferItem.TransferRequestedAmount <= 0) continue;
+                        // get item amount in current inventory
+                        MyFixedPoint availableItemAmount = supplyItem.Amount;
 
 
-                        // if items amount >= item amount for transfer
-                        if (supplyItem.Amount.ToIntSafe() >= transferItem.TransferRequestedAmount) {
+                        foreach (IMyInventory destinationInventory in destinationStorage) {
 
-                            PanelWriter.writeOutputDataLine("[>=] Start transfer for item " + transferItem.SubtypeId + " .\n Item count in storage " + supplyItem.Amount.ToString(), true);
+                            // if destination inventory is full then skip it
+                            if (destinationInventory.CurrentVolume + VolumeCalculator.itemVolumeM3(transferItem.SubtypeId, 1) > destinationInventory.MaxVolume) continue;
 
-                            // init MyFixedPoint from item amount for transfer (long) 
-                            MyFixedPoint fp = (int)transferItem.TransferRequestedAmount;
 
-                            // if transfer isn't made than return transfer error
-                            if (!supplyInventory.TransferItemTo(destinationInventory, supplyItem, fp)) return SmartTransferResult.TransferError;
+                            // init current transfer amount
+                            MyFixedPoint currentInventoryTransferAmount = 0;
 
-                            // reset item amount for transfer
-                            transferItem.TransferRequestedAmount = 0;
+                            // if inventory has enought item for transfer then set current amount transfer from requested transfer amount
+                            if (availableItemAmount >= transferItem.TransferRequestedAmount) currentInventoryTransferAmount = transferItem.TransferRequestedAmount;
 
-                            PanelWriter.writeOutputDataLine("[>=] Succesful transfer for item " + transferItem.SubtypeId + " . New transfer requested amount " + transferItem.TransferRequestedAmount.ToString(), true);
+                            // if inventory hasn't enought item for transfer then set current amount transfer equals item amount in current inventory
+                            else currentInventoryTransferAmount = availableItemAmount;
+
+                            // get summary volume of items number that we wanna to transfer
+                            MyFixedPoint currentInventoryTransferVolume = VolumeCalculator.itemVolumeM3(transferItem.SubtypeId, currentInventoryTransferAmount);
+
+
+                            // if we can't transfer item by current transfer amount
+                            if (destinationInventory.CurrentVolume + currentInventoryTransferVolume > destinationInventory.MaxVolume) {
+
+                                // calculate current transfer amount like: "(max container volume - current container volume) / volume of one item"
+                                currentInventoryTransferAmount = (int)(((float)(destinationInventory.MaxVolume - destinationInventory.CurrentVolume)) / (float)VolumeCalculator.itemVolumeM3(transferItem.SubtypeId, 1));
+
+                                // if current transfer amount > remaining requested amount then set current transfer amount from remaining requested amount
+                                if (currentInventoryTransferAmount > transferItem.TransferRequestedAmount) currentInventoryTransferAmount = transferItem.TransferRequestedAmount;
+
+                                // do transfer
+                                if (!supplyInventory.TransferItemTo(destinationInventory, supplyItem, currentInventoryTransferAmount)) return SmartTransferResult.TransferError;
+
+                                // reduce transfer requested amount by transfered amount
+                                transferItem.TransferRequestedAmount -= currentInventoryTransferAmount;
+
+                                // reduce available item amount in current supply inventory by transferred amount
+                                availableItemAmount -= currentInventoryTransferAmount;
+
+                            } else {
+
+                                // if current transfer amount > remaining requested amount then set current transfer amount from remaining requested amount
+                                if (currentInventoryTransferAmount > transferItem.TransferRequestedAmount) currentInventoryTransferAmount = transferItem.TransferRequestedAmount;
+
+                                // do transfer
+                                if (!supplyInventory.TransferItemTo(destinationInventory, supplyItem, currentInventoryTransferAmount)) return SmartTransferResult.TransferError;
+
+                                // reduce transfer requested amount by transfered amount
+                                transferItem.TransferRequestedAmount -= currentInventoryTransferAmount;
+
+                                // reduce available item amount in current supply inventory by transferred amount
+                                availableItemAmount -= currentInventoryTransferAmount;
+
+                                break;
+                            }
+
                         }
-
-                        // if items amount < item amount for transfer
-                        else if (supplyItem.Amount.ToIntSafe() < transferItem.TransferRequestedAmount) {
-
-                            PanelWriter.writeOutputDataLine("[<] Start transfer for item " + transferItem.SubtypeId + " .\n Item count in storage " + supplyItem.Amount.ToString(), true);
-
-                            // if transfer isn't made than return transfer error
-                            if (!supplyInventory.TransferItemTo(destinationInventory, supplyItem)) return SmartTransferResult.TransferError;
-
-                            // reduce item amount for transfer to transfered item amount
-                            transferItem.TransferRequestedAmount -= supplyItem.Amount.ToIntSafe();
-
-                            PanelWriter.writeOutputDataLine("[<] Succesful transfer for item " + transferItem.SubtypeId + " . New transfer requested amount " + transferItem.TransferRequestedAmount.ToString(), true);
-                        }
+                       
                     }
+
+                    // if requested transfer amount <= 0 means that we already transferred items
+                    if (transferItem.TransferRequestedAmount <= 0) break;
+
                 }
+
+                // check for maybe we couldn't transfer items 
+                if (transferItem.TransferRequestedAmount > 0) return SmartTransferResult.TransferError;
+
 
                 return SmartTransferResult.Succesful;
             }
@@ -241,24 +322,24 @@ namespace Template {
                 Worker.actualWorkState = Worker.WorkStates.WaitingStart;
             }
 
-            private static List<IMyInventory> getSupplyStorage(List<string> supplyStorageContainerNames) {
+            private static List<IMyInventory> getStorage(List<string> containerNames) {
 
                 // init inventory storage
-                List<IMyInventory> supplyStorage = new List<IMyInventory>();
+                List<IMyInventory> storage = new List<IMyInventory>();
 
-                foreach (string supplyContainerName in InputData.SupplyContainerNames) {
+                foreach (string containerName in containerNames) {
 
                     // get block
-                    IMyTerminalBlock block = GridTerminalSystem.GetBlockWithName(supplyContainerName);
+                    IMyCargoContainer block = GridTerminalSystem.GetBlockWithName(containerName) as IMyCargoContainer;
 
                     // if block is null then we can't find it and return null 
                     if (block == null) return null;
 
                     // add block inventory to storage
-                    supplyStorage.Add(block.GetInventory());
+                    storage.Add(block.GetInventory());
                 }
 
-                return supplyStorage;
+                return storage;
             }
 
             private static List<IMyAssembler> getAssemblers(List<string> assemblerNames) {
@@ -280,9 +361,9 @@ namespace Template {
                 return assemblers;
             }
 
-            private static void doTransfer(SmartItemTransferer smartTransferer, List<IMyInventory> supplyStorage, IMyInventory destinationInventory, List<TransferItem> transferItems, List<IMyAssembler> assemblers) {
+            private static void doTransfer(SmartItemTransferer smartTransferer, List<IMyInventory> supplyStorage, List<IMyInventory> destinationStorage, List<TransferItem> transferItems, List<IMyAssembler> assemblers) {
 
-                switch (smartTransferer.smartTransferTo(supplyStorage, destinationInventory, transferItems, assemblers)) {
+                switch (smartTransferer.smartTransferTo(supplyStorage, destinationStorage, transferItems, assemblers)) {
 
                     case SmartTransferResult.Succesful: {
                             PanelWriter.writeOutputDataLine("Перенос предметов успешно завершен.", true);
@@ -313,6 +394,18 @@ namespace Template {
                             break;
                         }
 
+                    case SmartTransferResult.NotEnoughtSupplyStorageVolume: {
+                            PanelWriter.writeOutputDataLine("Перенос предметов прерван. Причина: В исходном хранилище предметов \n не хватает места для приема собранных предметов", true);
+                            Worker.actualWorkState = Worker.WorkStates.Aborted;
+                            break;
+                        }
+
+                    case SmartTransferResult.NotEnoughDestinationStorageVolume: {
+                            PanelWriter.writeOutputDataLine("Перенос предметов прерван. Причина: В хранилище назначения не хватает места для приема предметов", true);
+                            Worker.actualWorkState = Worker.WorkStates.Aborted;
+                            break;
+                        }
+
                     default: {
                             PanelWriter.writeOutputDataLine("Перенос предметов прерван. Причина: Неизвестная ошибка", true);
                             Worker.actualWorkState = Worker.WorkStates.Aborted;
@@ -329,7 +422,7 @@ namespace Template {
                 Worker.actualWorkState = WorkStates.Processing;
 
                 // get supply storage
-                List<IMyInventory> supplyStorage = Worker.getSupplyStorage(InputData.SupplyContainerNames);
+                List<IMyInventory> supplyStorage = Worker.getStorage(InputData.SupplyContainerNames);
 
                 // if supply storage is null then abort work
                 if (supplyStorage == null) {
@@ -338,8 +431,14 @@ namespace Template {
                     return;
                 }
 
-                // Берем инвентарь назначения
-                IMyInventory destinationInventory = Worker.GridTerminalSystem.GetBlockWithName(InputData.DestinationContainerName).GetInventory();
+                // get destination storage
+                List<IMyInventory> destinationStorage = Worker.getStorage(InputData.DestinationContainerNames);
+
+                if(destinationStorage == null) {
+                    PanelWriter.writeOutputDataLine("Перенос предметов прерван. Причина: Ошибка данных хранилища назначения", true);
+                    Worker.actualWorkState = WorkStates.Aborted;
+                    return;
+                }
 
                 // Инициализируем парсер
                 InputPanelTextParser parser = new InputPanelTextParser();
@@ -364,7 +463,7 @@ namespace Template {
                     SmartItemTransferer smartTransferer = new SmartItemTransferer();
 
                     // get assemblers
-                    List<IMyAssembler> assemblers =  Worker.getAssemblers(InputData.AssemblerNames);
+                    List<IMyAssembler> assemblers = Worker.getAssemblers(InputData.AssemblerNames);
 
                     if (assemblers == null) {
                         PanelWriter.writeOutputDataLine("Перенос предметов прерван. Причина: Сборщики не найден", true);
@@ -373,7 +472,7 @@ namespace Template {
                     }
 
                     // do transfer
-                    Worker.doTransfer(smartTransferer, supplyStorage, destinationInventory, transferItems, assemblers);
+                    Worker.doTransfer(smartTransferer, supplyStorage, destinationStorage, transferItems, assemblers);
                 }
             }
 
@@ -381,7 +480,7 @@ namespace Template {
             public static void workResumption() {
 
                 // get supply storage
-                List<IMyInventory> supplyStorage = Worker.getSupplyStorage(InputData.SupplyContainerNames);
+                List<IMyInventory> supplyStorage = Worker.getStorage(InputData.SupplyContainerNames);
 
                 // if supply storage is null then abort work
                 if (supplyStorage == null) {
@@ -390,8 +489,14 @@ namespace Template {
                     return;
                 }
 
-                // Берем инвентарь назначения
-                IMyInventory destinationInventory = Worker.GridTerminalSystem.GetBlockWithName(InputData.DestinationContainerName).GetInventory();
+                // get destination storage
+                List<IMyInventory> destinationStorage = Worker.getStorage(InputData.DestinationContainerNames);
+
+                if (destinationStorage == null) {
+                    PanelWriter.writeOutputDataLine("Перенос предметов прерван. Причина: Ошибка данных хранилища назначения", true);
+                    Worker.actualWorkState = WorkStates.Aborted;
+                    return;
+                }
 
                 // Устанавливаем флаг, что работа снова в процесса
                 Worker.actualWorkState = Worker.WorkStates.Processing;
@@ -410,7 +515,7 @@ namespace Template {
                 }
 
                 // do transfer
-                Worker.doTransfer(smartTransferer, supplyStorage, destinationInventory, SmartItemTransfererSnapshot.Snapshot.TransferItems, SmartItemTransfererSnapshot.Snapshot.Assemblers);
+                Worker.doTransfer(smartTransferer, supplyStorage, destinationStorage, SmartItemTransfererSnapshot.Snapshot.TransferItems, SmartItemTransfererSnapshot.Snapshot.Assemblers);
             }
 
 
@@ -434,6 +539,45 @@ namespace Template {
 
         }
 
+        static class VolumeCalculator {
+
+            static public Dictionary<string, float> SubTypeIdVolume = new Dictionary<string, float>() {
+                { "BulletproofGlass", 8f }, { "Computer", 1f }, { "Construction", 2f },
+                { "Detector", 6f }, { "Display", 6f }, { "Explosives", 2f },
+                { "Girder", 2f }, { "GravityGenerator", 200f }, { "InteriorPlate",  5f},
+                { "LargeTube", 38f }, { "Medical", 160f }, { "MetalGrid", 15f },
+                { "Motor", 8f }, { "PowerCell", 45f }, { "RadioCommunication", 70f },
+                { "Reactor", 8f }, { "SmallTube", 2f }, { "SolarCell", 20f },
+                { "SteelPlate", 3f }, { "Superconductor", 8f }, { "Thrust", 10f }
+            };
+
+            static public float m3InOneLiter = 0.001f;
+
+            static public bool isEnoughVolume(List<IMyInventory> inventories, MyFixedPoint itemVolume) {
+
+                MyFixedPoint availableStorageVolume = 0;
+                
+                foreach (IMyInventory inventory in inventories) {
+                    availableStorageVolume += inventory.MaxVolume - inventory.CurrentVolume;
+                }
+
+                return availableStorageVolume >= itemVolume;
+            }
+
+            static public bool isEnoughVolume(IMyInventory inventory, MyFixedPoint itemVolume) {
+                return (inventory.MaxVolume - inventory.CurrentVolume) >= itemVolume;
+            }
+
+            static public MyFixedPoint itemVolumeM3(string subTypeId, MyFixedPoint itemCount) {
+                if (!SubTypeIdVolume.ContainsKey(subTypeId)) return 0; // TODO: exception
+
+                float itemVolume = 0;
+                SubTypeIdVolume.TryGetValue(subTypeId, out itemVolume);
+
+                return itemVolume * itemCount * m3InOneLiter;
+            }
+
+        }
 
         // Класс, содержащий utils данные и методы для панели ввода
         static class InputPanelTextHelper {
@@ -509,7 +653,7 @@ namespace Template {
 
                 // Проверка на пустоту и содержание символа перехода на следующую строку
                 if (tempBuilder.ToString() == "" || !tempBuilder.ToString().Contains('\n')) {
-                    PanelWriter.writeOutputDataLine("Parser error. Invalid default text", true);
+                    PanelWriter.writeOutputDataLine("Parser error. Invalid default text");
                     Worker.actualWorkState = Worker.WorkStates.Aborted;
                     return false;
                 }
@@ -519,7 +663,7 @@ namespace Template {
 
                 // Если первая строка в списке - не заглавие
                 if (!InputPanelTextHelper.isDefaultText(inputPanelDataStrings[0])) {
-                    PanelWriter.writeOutputDataLine("Parser error. Title not found", true);
+                    PanelWriter.writeOutputDataLine("Parser error. Title not found");
                     Worker.actualWorkState = Worker.WorkStates.Aborted;
                     return false;
                 }
@@ -532,7 +676,7 @@ namespace Template {
 
                 // Если размер сформированного списка не равен заданному
                 if (inputPanelDataStrings.Count != requiredDataStringsSize) {
-                    PanelWriter.writeOutputDataLine("Parser error. String lenghts is not equal", true);
+                    PanelWriter.writeOutputDataLine("Parser error. String lenghts is not equal");
                     Worker.actualWorkState = Worker.WorkStates.Aborted;
                     return false;
                 }
@@ -545,7 +689,7 @@ namespace Template {
                         // Очищаем словарь т.к. в него уже могли добавится данные, без очистки словаря при обрыве его заполнения в нём останется мусор
                         transferItems.Clear();
 
-                        PanelWriter.writeOutputDataLine("Парсер: зашли в не соедржит ' ' или = ", true);
+                        PanelWriter.writeOutputDataLine("Парсер: зашли в не соедржит ' ' или = ");
                         PanelWriter.writeOutputDataLine(componentString, true);
 
                         Worker.actualWorkState = Worker.WorkStates.Aborted;
@@ -568,7 +712,7 @@ namespace Template {
                         if (!Char.IsDigit(ch)) {
 
                             // Откидываем лог для оператора
-                            PanelWriter.writeOutputDataLine("Ошибка! В количество компонента передано не число", true);
+                            PanelWriter.writeOutputDataLine("Ошибка! В количество компонента передано не число");
 
                             // Переводим флаг в прерывание
                             Worker.actualWorkState = Worker.WorkStates.Aborted;
@@ -585,25 +729,18 @@ namespace Template {
 
                         transferItem.setData(InputPanelTextHelper.ComponentNamesRUSubtypesENG[componentNameAmount[0]], amount, false);
 
-                        PanelWriter.writeOutputDataLine("Мы добавили предмет " + transferItem.SubtypeId + " в transferItems ", true);
-
                         transferItems.Add(transferItem);
-
-                        PanelWriter.writeOutputDataLine("Вывод traferItems", true);
-                        foreach (TransferItem item in transferItems) {
-                            PanelWriter.writeOutputDataLine(item.SubtypeId, true);
-                        }
-
-                        PanelWriter.writeOutputDataLine("Предмет содержится в списке?" + transferItems.Contains(transferItem).ToString(), true);
                     }
 
                 }
 
                 if (transferItems.Count < 1) {
-                    PanelWriter.writeOutputDataLine("Перенос прерван, ни один предмет не был запрошен", true);
+                    PanelWriter.writeOutputDataLine("Parser error. No item requested for transfer");
                     Worker.actualWorkState = Worker.WorkStates.Aborted;
                     return false;
                 }
+
+                PanelWriter.writeOutputDataLine("Parse completed");
 
                 return true;
             }
@@ -623,8 +760,8 @@ namespace Template {
                 { "SteelPlate", "SteelPlate" }, { "Superconductor", "Superconductor" }, { "Thrust", "ThrustComponent" }
             };
 
-            
-            static public bool assembleComponent(IMyAssembler assembler, string subtypeId, long amount) {
+
+            static public bool assembleComponent(IMyAssembler assembler, string subtypeId, MyFixedPoint amount) {
 
                 if (!ComponentAndBlueprintSubtypes.Keys.Contains(subtypeId)) {
                     PanelWriter.writeOutputDataLine("Компонент с подтипом: " + subtypeId, true);
@@ -636,15 +773,12 @@ namespace Template {
                 // Получаем MyDefinitionId из item
                 MyDefinitionId defID = MyDefinitionId.Parse(AssemblerManager.BlueprintType + AssemblerManager.ComponentAndBlueprintSubtypes[subtypeId]);
 
-                // Получаем MyFixedPoint из long
-                MyFixedPoint fpAmount = (int)amount;
-
                 PanelWriter.writeOutputDataLine("defID: " + defID, true);
 
                 PanelWriter.writeOutputDataLine((assembler.CanUseBlueprint(defID)).ToString(), true);
 
                 // Добавляем в очередь создание предмета item в количестве amount
-                assembler.AddQueueItem(defID, fpAmount);
+                assembler.AddQueueItem(defID, amount);
 
                 PanelWriter.writeOutputDataLine("ПОСЛЕ адд ту квае", true);
 
@@ -668,9 +802,9 @@ namespace Template {
 
             }
 
-            static public int itemCraftCount(List<IMyAssembler> assemblers, string itemSubtypeID) {
+            static public MyFixedPoint itemCraftAmount(List<IMyAssembler> assemblers, string itemSubtypeID) {
 
-                int targetItemCraftCount = 0;
+                MyFixedPoint targetItemCraftCount = 0;
 
                 foreach (IMyAssembler assembler in assemblers) {
 
@@ -684,7 +818,7 @@ namespace Template {
                     foreach (MyProductionItem queueItem in queueItems) {
 
                         // if got item has equals definition id with target item 
-                        if (queueItem.BlueprintId == targetItemDefinitionID) targetItemCraftCount += queueItem.Amount.ToIntSafe();
+                        if (queueItem.BlueprintId == targetItemDefinitionID) targetItemCraftCount += queueItem.Amount;
 
                     }
 
@@ -695,15 +829,15 @@ namespace Template {
 
             }
 
-            static public bool assembleComponent(List<IMyAssembler> assemblers, string subtypeId, long amount) {
+            static public bool assembleComponent(List<IMyAssembler> assemblers, string subtypeId, MyFixedPoint amount) {
 
                 // TODO: checks for block availability
 
 
                 // activate cooperative mode for assemblers
-                IMyAssembler masterAssembler =  AssemblerManager.activateCooperativeMode(assemblers);
+                IMyAssembler masterAssembler = AssemblerManager.activateCooperativeMode(assemblers);
 
-                if(masterAssembler == null) return false;
+                if (masterAssembler == null) return false;
 
                 // assemble compoment on master assembler
                 return AssemblerManager.assembleComponent(assemblers.First(), subtypeId, amount);
@@ -732,7 +866,7 @@ namespace Template {
                 public List<IMyInventory> SupplyStorage { get; private set; }
 
                 // Инвентарь назначения
-                public IMyInventory DestinationInventory { get; private set; }
+                public List<IMyInventory> DestinationStorage { get; private set; }
 
                 // Список предметов на перенос
                 public List<TransferItem> TransferItems { get; private set; }
@@ -741,9 +875,9 @@ namespace Template {
                 public List<IMyAssembler> Assemblers { get; private set; }
 
                 // Конструктор по умолчанию
-                public SmartTransferToSnapshot(List<IMyInventory> supplyStorage, IMyInventory destinationInventory, List<TransferItem> transferItems, List<IMyAssembler> assemblers) {
+                public SmartTransferToSnapshot(List<IMyInventory> supplyStorage, List<IMyInventory> destinationStorage, List<TransferItem> transferItems, List<IMyAssembler> assemblers) {
                     this.SupplyStorage = supplyStorage;
-                    this.DestinationInventory = destinationInventory;
+                    this.DestinationStorage = destinationStorage;
                     this.TransferItems = transferItems;
                     this.Assemblers = assemblers;
                 }
